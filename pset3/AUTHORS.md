@@ -3,15 +3,13 @@ Author and collaborators
 
 Primary student
 ---------------
-(Your name.)
-
+joe hulsizer
 
 Collaborators
 -------------
-(List any other collaborators and describe help you got from other students
-in the class.)
+none
 
 
 Citations
 ---------
-(List any other sources consulted.)
+none
