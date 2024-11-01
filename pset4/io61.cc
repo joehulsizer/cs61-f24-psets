@@ -3,6 +3,7 @@
 #include <sys/stat.h>
 #include <climits>
 #include <cerrno>
+#include <sys/mman.h>
 
 // io61.cc
 //    YOUR CODE HERE!
@@ -14,6 +15,14 @@
 struct io61_file {
     int fd = -1;     // file descriptor
     int mode;        // open mode (O_RDONLY or O_WRONLY)
+    static constexpr off_t buf_size = 8196;
+    unsigned char buf[buf_size];
+    off_t buf_pos;
+    off_t buf_end;
+    off_t buf_start;
+    size_t size;
+    char* memy_buf = nullptr;
+    size_t memy_off = 0;
 };
 
 
@@ -27,6 +36,15 @@ io61_file* io61_fdopen(int fd, int mode) {
     io61_file* f = new io61_file;
     f->fd = fd;
     f->mode = mode;
+    if (mode == O_RDONLY) {
+        off_t size = io61_filesize(f);
+        char* memdata = (char*)mmap(nullptr, size, PROT_READ, MAP_SHARED, fd, 0);
+        if (memdata != (char*)MAP_FAILED) {
+            f->memy_buf = memdata;
+            f->size = size;
+            f->memy_off = 0;
+        }
+    }
     return f;
 }
 
@@ -36,28 +54,34 @@ io61_file* io61_fdopen(int fd, int mode) {
 
 int io61_close(io61_file* f) {
     io61_flush(f);
+    if (f->memy_buf) {
+        munmap(f->memy_buf, f->size);
+    }
     int r = close(f->fd);
     delete f;
     return r;
 }
 
-
 // io61_readc(f)
 //    Reads a single (unsigned) byte from `f` and returns it. Returns EOF,
 //    which equals -1, on end of file or error.
-
+void io61_fill(io61_file* f);
 int io61_readc(io61_file* f) {
-    unsigned char ch;
-    ssize_t nr = read(f->fd, &ch, 1);
-    if (nr == 1) {
-        return ch;
-    } else if (nr == 0) {
-        errno = 0; // clear `errno` to indicate EOF
-        return -1;
-    } else {
-        assert(nr == -1 && errno > 0);
-        return -1;
+    assert(f->buf_start <= f->buf_pos && f->buf_pos <= f->buf_end);
+    assert(f->buf_end - f->buf_pos <= io61_file::buf_size);
+    if(f->memy_buf){
+        if(f->memy_off >= (size_t)f->size) {
+            return EOF;
+        }
+        return (unsigned char)f->memy_buf[f->memy_off++];
     }
+    if (f->buf_pos == f->buf_end) {
+        io61_fill(f);
+        if (f->buf_pos == f->buf_end) {
+            return EOF;
+        }
+    }
+    return f->buf[f->buf_pos++ - f->buf_start]; 
 }
 
 
@@ -71,38 +95,65 @@ int io61_readc(io61_file* f) {
 //    if end-of-file or error is encountered before all `sz` bytes are read.
 //    This is called a “short read.”
 
-ssize_t io61_read(io61_file* f, unsigned char* buf, size_t sz) {
-    size_t nread = 0;
-    while (nread != sz) {
-        int ch = io61_readc(f);
-        if (ch == EOF) {
-            break;
-        }
-        buf[nread] = ch;
-        ++nread;
-    }
-    if (nread != 0 || sz == 0 || errno == 0) {
-        return nread;
-    } else {
-        return -1;
+
+void io61_fill(io61_file* f) {
+    assert(f->buf_start <= f->buf_pos && f->buf_pos <= f->buf_end);
+    assert(f->buf_end - f->buf_pos <= io61_file::buf_size);
+    f->buf_start = f->buf_pos = f->buf_end;
+    ssize_t n = read(f->fd, f->buf, io61_file::buf_size);
+    if (n >= 0) {
+        f->buf_end = f->buf_start + n;
     }
 }
-
+ssize_t io61_read(io61_file* f, unsigned char* buf, size_t sz) {
+    assert(f->buf_start <= f->buf_pos && f->buf_pos <= f->buf_end);
+    assert(f->buf_end - f->buf_pos <= io61_file::buf_size);
+    if(f->memy_buf) {
+        size_t available = f->size - f->memy_off;
+        size_t copysz = std::min(sz, available);
+        if(copysz <= 0) {
+            return -1;
+        }
+        memcpy(buf, f->memy_buf + f->memy_off, copysz); 
+        f->memy_off += copysz;
+        return copysz;
+    }
+    size_t position = 0;
+    while (sz > position) {
+        if (f->buf_pos == f->buf_end) {
+            io61_fill(f); 
+            if (f->buf_pos == f->buf_end) {
+                break;
+            }
+        }
+        size_t available = f->buf_end - f->buf_pos;
+        size_t copysz = std::min(sz - position, available);
+        memcpy(buf + position, &(f->buf[f->buf_pos - f->buf_start]), copysz);
+        f->buf_pos += copysz;
+        position += copysz;
+    }
+    return position;
+}
 
 // io61_writec(f)
 //    Write a single character `c` to `f` (converted to unsigned char).
 //    Returns 0 on success and -1 on error.
 
 int io61_writec(io61_file* f, int c) {
+    assert(f->buf_start <= f->buf_pos && f->buf_pos <= f->buf_end);
+    assert(f->buf_end - f->buf_pos <= io61_file::buf_size); 
     unsigned char ch = c;
-    ssize_t nw = write(f->fd, &ch, 1);
-    if (nw == 1) {
-        return 0;
-    } else {
-        return -1;
+    if (f->buf_end == f->buf_start + io61_file::buf_size) {
+        io61_flush(f);
+        if (f->buf_end == f->buf_start + io61_file::buf_size) {
+            return -1;
+        }
     }
+    f->buf[f->buf_end - f->buf_start] = ch;
+    f->buf_end++;
+    f->buf_pos++;
+    return 0;
 }
-
 
 // io61_write(f, buf, sz)
 //    Writes `sz` characters from `buf` to `f`. Returns `sz` on success.
@@ -112,18 +163,25 @@ int io61_writec(io61_file* f, int c) {
 //    before the error occurred.
 
 ssize_t io61_write(io61_file* f, const unsigned char* buf, size_t sz) {
-    size_t nwritten = 0;
-    while (nwritten != sz) {
-        if (io61_writec(f, buf[nwritten]) == -1) {
-            break;
+    assert(f->buf_start <= f->buf_pos && f->buf_pos <= f->buf_end);
+    assert(f->buf_end - f->buf_pos <= io61_file::buf_size);
+    assert(f->buf_pos == f->buf_end);
+    size_t position = 0;
+    while (position < sz) {
+        if (f->buf_end == f->buf_start + io61_file::buf_size) {
+            io61_flush(f);
+            if (f->buf_end == f->buf_start + io61_file::buf_size) {
+                break;
+            }
         }
-        ++nwritten;
+        size_t available = io61_file::buf_size - (f->buf_end - f->buf_start);
+        size_t copysz = std::min(sz - position, available);
+        memcpy(&(f->buf[f->buf_end - f->buf_start]), buf + position, copysz);
+        f->buf_end += copysz;
+        f->buf_pos += copysz;
+        position += copysz;
     }
-    if (nwritten != 0 || sz == 0) {
-        return nwritten;
-    } else {
-        return -1;
-    }
+    return position;
 }
 
 
@@ -136,7 +194,30 @@ ssize_t io61_write(io61_file* f, const unsigned char* buf, size_t sz) {
 //    drop any data cached for reading.
 
 int io61_flush(io61_file* f) {
-    (void) f;
+    if(f->mode == O_RDONLY) {
+        return 0;
+    }
+
+    assert(f->buf_start <= f->buf_pos && f->buf_pos <= f->buf_end);
+    assert(f->buf_end - f->buf_pos <= io61_file::buf_size);
+
+    assert(f->buf_pos == f->buf_end);
+    
+    size_t pos = 0;
+    while (pos < size_t(f->buf_end - f->buf_start)) {
+        ssize_t nw = write(f->fd, f->buf + pos, f->buf_end - f->buf_start - pos); 
+        if (nw >= 0) {
+            pos += nw;
+        } else if (nw == -1) {
+            if (errno == EINTR|| errno == EAGAIN) {
+                continue;
+            }
+            return -1;
+        }
+    }
+
+    f->buf_end = f->buf_pos = f->buf_start;
+    
     return 0;
 }
 
@@ -146,11 +227,46 @@ int io61_flush(io61_file* f) {
 //    Returns 0 on success and -1 on failure.
 
 int io61_seek(io61_file* f, off_t off) {
-    off_t r = lseek(f->fd, (off_t) off, SEEK_SET);
-    // Ignore the returned offset unless it’s an error.
-    if (r == -1) {
-        return -1;
+    if(f->memy_buf) {
+        f->memy_off = off;
+        return 0;
+    }
+    
+    if (off >= f->buf_start && off <= f->buf_end && off != 0) {
+
+        if(f->mode == O_RDONLY) {
+            f->buf_pos = off;
+            return 0;
+        }
+        else{
+            f->buf_pos = f->buf_end = off;
+            return 0;
+        }
     } else {
+        if (f->mode == O_RDONLY) {
+            off_t off_aligned = (off / io61_file::buf_size) * io61_file::buf_size; 
+
+            off_t r = lseek(f->fd, off_aligned, SEEK_SET);
+            if (r == -1) {
+                return -1;
+            }
+
+            f->buf_start = f->buf_pos = f->buf_end = off_aligned; 
+            io61_fill(f);
+            f->buf_pos = off;
+        
+        } else {
+            int n = io61_flush(f);
+            if (n == -1) {
+                return -1;
+            }
+            off_t r = lseek(f->fd, off, SEEK_SET);
+            if (r == -1) {
+                return -1;
+            }
+            f->buf_start = f->buf_pos = f->buf_end = off;
+        }
+
         return 0;
     }
 }
