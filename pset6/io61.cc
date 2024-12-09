@@ -6,6 +6,8 @@
 #include <condition_variable>
 #include <sys/types.h>
 #include <sys/stat.h>
+#include <atomic>
+#include <vector>
 
 // io61.cc
 //    YOUR CODE HERE!
@@ -27,11 +29,20 @@ struct io61_file {
     off_t end_tag;   // offset one past last valid character in `cbuf`
 
     // Positioned mode
-    bool dirty = false;       // has cache been written?
+    std::atomic<bool> dirty{false};  // has cache been written?
     bool positioned = false;  // is cache in positioned mode?
+
+    std::recursive_mutex mtx;  
+    size_t num_locks = 0;
+    std::mutex* account_locks = nullptr;
 };
 
-
+static int locked_io61_flush(io61_file* f);
+static int io61_fill(io61_file* f);
+static int io61_flush_dirty(io61_file* f);
+static int io61_flush_dirty_positioned(io61_file* f);
+static int io61_flush_clean(io61_file* f);
+static int io61_pfill(io61_file* f, off_t off);
 // io61_fdopen(fd, mode)
 //    Returns a new io61_file for file descriptor `fd`. `mode` is either
 //    O_RDONLY for a read-only file, O_WRONLY for a write-only file,
@@ -52,6 +63,15 @@ io61_file* io61_fdopen(int fd, int mode) {
         f->tag = f->pos_tag = f->end_tag = 0;
     }
     f->dirty = f->positioned = false;
+
+    off_t sz = io61_filesize(f);
+    if (sz < 0) {
+        sz = 128 * 16 * 1024; 
+    }
+    size_t num_accounts = (sz + 15) / 16;
+    f->num_locks = num_accounts;
+    f->account_locks = new std::mutex[f->num_locks];
+
     return f;
 }
 
@@ -76,6 +96,7 @@ int io61_close(io61_file* f) {
 static int io61_fill(io61_file* f);
 
 int io61_readc(io61_file* f) {
+    std::unique_lock<std::recursive_mutex> guard(f->mtx);
     assert(!f->positioned);
     if (f->pos_tag == f->end_tag) {
         io61_fill(f);
@@ -100,6 +121,7 @@ int io61_readc(io61_file* f) {
 //    This is called a “short read.”
 
 ssize_t io61_read(io61_file* f, unsigned char* buf, size_t sz) {
+    std::unique_lock<std::recursive_mutex> guard(f->mtx);
     assert(!f->positioned);
     size_t nread = 0;
     while (nread != sz) {
@@ -126,6 +148,7 @@ ssize_t io61_read(io61_file* f, unsigned char* buf, size_t sz) {
 //    Returns 0 on success and -1 on error.
 
 int io61_writec(io61_file* f, int c) {
+    std::unique_lock<std::recursive_mutex> guard(f->mtx);
     assert(!f->positioned);
     if (f->pos_tag == f->tag + f->cbufsz) {
         int r = io61_flush(f);
@@ -149,6 +172,7 @@ int io61_writec(io61_file* f, int c) {
 //    before the error occurred.
 
 ssize_t io61_write(io61_file* f, const unsigned char* buf, size_t sz) {
+    std::unique_lock<std::recursive_mutex> guard(f->mtx);
     assert(!f->positioned);
     size_t nwritten = 0;
     while (nwritten != sz) {
@@ -185,6 +209,11 @@ static int io61_flush_dirty_positioned(io61_file* f);
 static int io61_flush_clean(io61_file* f);
 
 int io61_flush(io61_file* f) {
+    std::unique_lock<std::recursive_mutex> guard(f->mtx);
+    return locked_io61_flush(f);
+}
+
+static int locked_io61_flush(io61_file* f) {
     if (f->dirty && f->positioned) {
         return io61_flush_dirty_positioned(f);
     } else if (f->dirty) {
@@ -200,7 +229,8 @@ int io61_flush(io61_file* f) {
 //    Returns 0 on success and -1 on failure.
 
 int io61_seek(io61_file* f, off_t off) {
-    int r = io61_flush(f);
+    std::unique_lock<std::recursive_mutex> guard(f->mtx);
+    int r = locked_io61_flush(f);
     if (r == -1) {
         return -1;
     }
@@ -300,6 +330,7 @@ static int io61_pfill(io61_file* f, off_t off);
 
 ssize_t io61_pread(io61_file* f, unsigned char* buf, size_t sz,
                    off_t off) {
+    std::unique_lock<std::recursive_mutex> guard(f->mtx);
     if (!f->positioned || off < f->tag || off >= f->end_tag) {
         if (io61_pfill(f, off) == -1) {
             return -1;
@@ -321,6 +352,7 @@ ssize_t io61_pread(io61_file* f, unsigned char* buf, size_t sz,
 
 ssize_t io61_pwrite(io61_file* f, const unsigned char* buf, size_t sz,
                     off_t off) {
+    std::unique_lock<std::recursive_mutex> guard(f->mtx);
     if (!f->positioned || off < f->tag || off >= f->end_tag) {
         if (io61_pfill(f, off) == -1) {
             return -1;
@@ -340,7 +372,7 @@ ssize_t io61_pwrite(io61_file* f, const unsigned char* buf, size_t sz,
 
 static int io61_pfill(io61_file* f, off_t off) {
     assert(f->mode == O_RDWR);
-    if (f->dirty && io61_flush(f) == -1) {
+    if (f->dirty && locked_io61_flush(f) == -1) {
         return -1;
     }
 
@@ -370,12 +402,26 @@ static int io61_pfill(io61_file* f, off_t off) {
 //    block: if the lock cannot be acquired, it returns -1 right away.
 
 int io61_try_lock(io61_file* f, off_t off, off_t len, int locktype) {
-    (void) f;
     assert(off >= 0 && len >= 0);
     assert(locktype == LOCK_EX || locktype == LOCK_SH);
     if (len == 0) {
         return 0;
     }
+
+    size_t start_lock = off / 16;
+    size_t end_lock = (off + len - 1) / 16;
+    std::vector<size_t> locked;
+    locked.reserve(end_lock - start_lock + 1);
+    for (size_t i = start_lock; i <= end_lock; i++) {
+        if (!f->account_locks[i].try_lock()) {
+            for (size_t j : locked) {
+                f->account_locks[j].unlock();
+            }
+            return -1;
+        }
+        locked.push_back(i);
+    }
+
     return 0;
 }
 
@@ -397,9 +443,13 @@ int io61_lock(io61_file* f, off_t off, off_t len, int locktype) {
     if (len == 0) {
         return 0;
     }
-    // The handout code polls using `io61_try_lock`.
-    while (io61_try_lock(f, off, len, locktype) != 0) {
+
+    size_t start_lock = off / 16;
+    size_t end_lock = (off + len - 1) / 16;
+    for (size_t i = start_lock; i <= end_lock; i++) {
+        f->account_locks[i].lock();
     }
+
     return 0;
 }
 
@@ -409,11 +459,16 @@ int io61_lock(io61_file* f, off_t off, off_t len, int locktype) {
 //    Returns 0 on success and -1 on error.
 
 int io61_unlock(io61_file* f, off_t off, off_t len) {
-    (void) f;
     assert(off >= 0 && len >= 0);
     if (len == 0) {
         return 0;
     }
+    size_t start_lock = off / 16;
+    size_t end_lock = (off + len - 1) / 16;
+    for (size_t i = end_lock + 1; i-- > start_lock; ) {
+        f->account_locks[i].unlock();
+    }
+
     return 0;
 }
 
